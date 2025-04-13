@@ -174,10 +174,25 @@ wss.on('connection', (ws) => {
             switch (data.type) {
                 case 'pause_transcription':
                     isTranscriptionPaused = Boolean(data.pause);
+                    console.log('Transcription pause state:', isTranscriptionPaused);
                     if (isTranscriptionPaused && sttService) {
+                        console.log('Stopping STT service due to pause');
                         sttService.stop();
                         sttService = null;
-                    } else if (!isTranscriptionPaused && !sttService) {
+                    }
+                    break;
+
+                case 'stop_stream':
+                    if (sttService) {
+                        console.log('Stopping STT stream on client request');
+                        sttService.stop();
+                        sttService = null;
+                    }
+                    break;
+
+                case 'start_stream':
+                    if (!isTranscriptionPaused && !sttService) {
+                        console.log('Starting new STT stream on client request');
                         initializeServices();
                     }
                     break;

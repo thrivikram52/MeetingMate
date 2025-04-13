@@ -135,6 +135,7 @@ function App() {
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
   const processorRef = useRef(null);
+  const sourceNodeRef = useRef(null);
   const conversationsEndRef = useRef(null);
 
   // Add recording state ref at component level
@@ -263,9 +264,30 @@ function App() {
         pause: isTranscriptionPaused
       }));
       
-      // If paused, immediately set audio level to 0
+      // If paused, disconnect audio nodes
       if (isTranscriptionPaused) {
         setCurrentAudioLevel(0);
+        // Disconnect audio nodes but keep them in memory
+        if (sourceNodeRef.current) {
+          sourceNodeRef.current.disconnect();
+        }
+        if (processorRef.current) {
+          processorRef.current.disconnect();
+        }
+        // Stop the current STT stream to ensure clean state
+        wsRef.current.send(JSON.stringify({
+          type: 'stop_stream'
+        }));
+      } else {
+        // When resuming, reconnect existing audio nodes if they exist
+        if (sourceNodeRef.current && processorRef.current && audioContextRef.current) {
+          sourceNodeRef.current.connect(processorRef.current);
+          processorRef.current.connect(audioContextRef.current.destination);
+          // Send message to reinitialize the stream
+          wsRef.current.send(JSON.stringify({
+            type: 'start_stream'
+          }));
+        }
       }
     }
   }, [isTranscriptionPaused]);
@@ -289,6 +311,11 @@ function App() {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
         streamRef.current = null;
+      }
+
+      if (sourceNodeRef.current) {
+        sourceNodeRef.current.disconnect();
+        sourceNodeRef.current = null;
       }
 
       // Get microphone permission first
@@ -318,14 +345,16 @@ function App() {
 
       // Create audio nodes
       const source = audioContext.createMediaStreamSource(stream);
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);  // Increased buffer size
+      sourceNodeRef.current = source;
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
       
       // Set up audio processor
       processor.onaudioprocess = (e) => {
+        // If not recording or transcription is paused, just update UI and return
         if (!isRecordingRef.current || isTranscriptionPaused) {
           setCurrentAudioLevel(0);
-          return;
+          return;  // Early return to prevent any audio processing
         }
 
         try {
@@ -448,6 +477,11 @@ function App() {
     setIsRecording(false);
     
     // Disconnect audio nodes
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current = null;
