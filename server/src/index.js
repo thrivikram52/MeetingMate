@@ -8,24 +8,48 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-wss.on('connection', (ws) => {
+// Add server-wide connection logging
+console.log('🚀 WebSocket server started on port 3000');
+
+wss.on('connection', (ws, req) => {
     console.log('🟢 New client connected');
+
+    // Add connection error handler
+    ws.on('error', (error) => {
+        console.error('🔴 WebSocket error:', error.message);
+    });
+
     let sttService = null;
     let llmService = null;
     let isTranscriptionPaused = false;
     let isLLMPaused = false;
     let pendingLLMRequests = 0;
 
+    // Helper function to process text with LLM
+    const processWithLLM = async (text, isVoiceInput = false) => {
+        try {
+            if (!text || !text.trim()) {
+                console.log('❌ Empty text received, skipping LLM processing');
+                return null;
+            }
+
+            if (!llmService) {
+                console.log('🤖 Creating new LLM service for processing');
+                llmService = new LLMService();
+            }
+            
+            const llmResponse = await llmService.processText(text, isVoiceInput);
+            return llmResponse;
+        } catch (error) {
+            console.error('❌ LLM processing error:', error.message);
+            throw error;
+        }
+    };
+
     const initializeServices = () => {
-        console.log('📡 Initializing services...');
         if (!sttService) {
             console.log('🎤 Creating new STT service');
             sttService = new GoogleSTTService();
-            
-            sttService.on('endOfSpeech', () => {
-                console.log('🎤 End of speech detected');
-                // Optional: You can add additional handling here
-            });
 
             sttService.on('partial', (data) => {
                 if (ws.readyState === WebSocket.OPEN) {
@@ -41,81 +65,44 @@ wss.on('connection', (ws) => {
             sttService.on('final', async (data) => {
                 if (ws.readyState === WebSocket.OPEN) {
                     console.log('📝 Final transcript:', data.text);
+                    
+                    const transcriptId = Date.now().toString();
+                    
                     ws.send(JSON.stringify({ 
                         type: 'transcript', 
                         data: data.text,
                         confidence: data.confidence,
-                        isFinal: true 
+                        isFinal: true,
+                        transcriptId: transcriptId
                     }));
-                    
-                    if (!isLLMPaused && llmService && data.text.trim()) {
-                        console.log('🤖 Processing with LLM...');
-                        pendingLLMRequests++;
+
+                    if (!isLLMPaused && data.text.trim()) {
                         try {
-                            const llmResponse = await llmService.processText(data.text);
-                            pendingLLMRequests--;
-                            
-                            if (ws.readyState === WebSocket.OPEN) {
-                                console.log('✨ Sending LLM response to client:', llmResponse);
-                                ws.send(JSON.stringify({ 
-                                    type: 'llm_response', 
-                                    data: llmResponse
-                                }));
+                            const llmResponse = await processWithLLM(data.text, true);  // Voice input
+                            if (ws.readyState === WebSocket.OPEN && llmResponse) {
+                                const response = {
+                                    type: 'llm_response',
+                                    data: llmResponse,
+                                    transcriptId: transcriptId
+                                };
+                                console.log('✅ LLM response sent');
+                                ws.send(JSON.stringify(response));
                             }
                         } catch (error) {
-                            pendingLLMRequests--;
-                            console.error('❌ LLM processing error:', error);
-                            
-                            // Check if it's a rate limit error
-                            if (error.response?.status === 429) {
-                                console.log('⏳ Rate limit hit, waiting before retry...');
-                                setTimeout(async () => {
-                                    try {
-                                        const llmResponse = await llmService.processText(data.text);
-                                        if (ws.readyState === WebSocket.OPEN) {
-                                            console.log('✨ Sending LLM response after retry:', llmResponse);
-                                            ws.send(JSON.stringify({ 
-                                                type: 'llm_response', 
-                                                data: llmResponse
-                                            }));
-                                        }
-                                    } catch (retryError) {
-                                        console.error('❌ LLM retry failed:', retryError);
-                                        sendError(ws, 'Failed to process text with LLM after retry');
-                                    }
-                                }, 2000);
-                            } else {
-                                // For other errors, send a more detailed error message
-                                const errorMessage = error.response?.data?.error?.message || error.message || 'Unknown error';
-                                console.error('❌ LLM error details:', errorMessage);
-                                sendError(ws, `Error processing text with LLM: ${errorMessage}`);
-                            }
+                            sendError(ws, 'Error processing with LLM: ' + error.message, transcriptId);
                         }
-                    } else {
-                        console.log('⏸️  LLM processing skipped (paused)');
                     }
                 }
             });
 
             sttService.on('error', (error) => {
                 console.error('🚨 STT Error:', error);
-                if (error.code === 11) {
-                    console.log('⏱️  Audio stream timeout, restarting...');
-                    sendError(ws, 'Audio stream timeout. Restarting...');
-                } else {
-                    console.error('❌ Audio processing error:', error.message || error);
-                    sendError(ws, 'Error processing audio');
-                }
+                sendError(ws, 'Error processing audio: ' + error.message);
             });
-        }
-
-        if (!llmService) {
-            console.log('🤖 Creating new LLM service');
-            llmService = new LLMService();
         }
     };
 
-    const sendError = (ws, message) => {
+    const sendError = (ws, message, transcriptId = null) => {
         if (ws.readyState === WebSocket.OPEN) {
             console.error('❌ Sending error to client:', message);
             ws.send(JSON.stringify({ 
@@ -123,42 +110,16 @@ wss.on('connection', (ws) => {
                 data: { 
                     message: String(message),
                     timestamp: new Date().toISOString()
-                }
+                },
+                transcriptId
             }));
         }
     };
 
-    const cleanupServices = () => {
-        console.log('🧹 Cleaning up services...');
-        if (pendingLLMRequests > 0) {
-            console.log('⏳ Waiting for', pendingLLMRequests, 'pending LLM requests...');
-            setTimeout(() => {
-                if (sttService) {
-                    console.log('⏹️  Stopping STT service');
-                    sttService.stop();
-                    sttService = null;
-                }
-                llmService = null;
-                isTranscriptionPaused = false;
-                isLLMPaused = false;
-                console.log('✅ Cleanup complete');
-            }, 1000);
-        } else {
-            if (sttService) {
-                console.log('⏹️  Stopping STT service');
-                sttService.stop();
-                sttService = null;
-            }
-            llmService = null;
-            isTranscriptionPaused = false;
-            isLLMPaused = false;
-            console.log('✅ Cleanup complete');
-        }
-    };
-
+    // Handle raw messages before parsing
     ws.on('message', async (message) => {
-        if (message instanceof Buffer) {
-            // Process audio data without logging packet details
+        // Handle audio data (binary)
+        if (message instanceof Buffer && message.length > 100) {
             if (!isTranscriptionPaused) {
                 if (!sttService) {
                     initializeServices();
@@ -168,63 +129,83 @@ wss.on('connection', (ws) => {
             return;
         }
 
+        // Handle text messages
         try {
-            const data = JSON.parse(message);
+            const messageStr = message instanceof Buffer ? message.toString() : message.toString();
+            const data = JSON.parse(messageStr);
             
-            switch (data.type) {
-                case 'pause_transcription':
-                    isTranscriptionPaused = Boolean(data.pause);
-                    console.log('Transcription pause state:', isTranscriptionPaused);
-                    if (isTranscriptionPaused && sttService) {
-                        console.log('Stopping STT service due to pause');
-                        sttService.stop();
-                        sttService = null;
+            if (data.type === 'process_llm') {
+                console.log('📝 Processing text:', data.data);
+                
+                if (isLLMPaused) {
+                    console.log('⏸️ LLM processing is paused');
+                    return;
+                }
+
+                if (!data.data?.trim()) {
+                    console.log('⚠️ Empty text received');
+                    return;
+                }
+
+                try {
+                    const llmResponse = await processWithLLM(data.data, false);  // Text input
+                    
+                    if (!llmResponse) {
+                        console.log('⚠️ No response from LLM');
+                        return;
                     }
-                    break;
 
-                case 'stop_stream':
-                    if (sttService) {
-                        console.log('Stopping STT stream on client request');
-                        sttService.stop();
-                        sttService = null;
+                    if (ws.readyState === WebSocket.OPEN) {
+                        const response = {
+                            type: 'llm_response',
+                            data: llmResponse,
+                            transcriptId: data.transcriptId
+                        };
+                        console.log('✅ LLM response details:', {
+                            type: response.type,
+                            transcriptId: response.transcriptId,
+                            skip: llmResponse.skip,
+                            hasQuestions: llmResponse.questions?.length > 0,
+                            hasAnswers: llmResponse.answers?.length > 0,
+                            hasSuggestions: llmResponse.suggestions?.length > 0,
+                            rawResponse: llmResponse
+                        });
+                        ws.send(JSON.stringify(response));
+                        console.log('✅ Response sent to client');
                     }
-                    break;
-
-                case 'start_stream':
-                    if (!isTranscriptionPaused && !sttService) {
-                        console.log('Starting new STT stream on client request');
-                        initializeServices();
-                    }
-                    break;
-
-                case 'pause_llm':
-                    isLLMPaused = Boolean(data.pause);
-                    break;
-
-                default:
-                    console.warn('⚠️  Unknown message type:', data.type);
+                } catch (error) {
+                    console.error('❌ LLM processing error:', error.message);
+                    sendError(ws, 'Error processing with LLM: ' + error.message, data.transcriptId);
+                }
+            } else if (data.type === 'pause_transcription') {
+                console.log('🎤 Transcription ' + (data.pause ? 'paused' : 'resumed'));
+                isTranscriptionPaused = data.pause;
+                if (isTranscriptionPaused && sttService) {
+                    sttService.stop();
+                    sttService = null;
+                }
+            } else if (data.type === 'pause_llm') {
+                console.log('🤖 LLM ' + (data.pause ? 'paused' : 'resumed'));
+                isLLMPaused = data.pause;
+            } else {
+                console.log('⚠️ Unknown message type:', data.type);
             }
         } catch (error) {
-            console.error('❌ Error processing message:', error);
-            sendError(ws, 'Invalid message format');
+            console.error('❌ Message processing error:', error.message);
+            sendError(ws, 'Error processing message: ' + error.message);
         }
     });
 
     ws.on('close', () => {
         console.log('🔴 Client disconnected');
-        cleanupServices();
+        if (sttService) {
+            sttService.stop();
+            sttService = null;
+        }
+        llmService = null;
     });
-
-    ws.on('error', (error) => {
-        console.error('🚨 WebSocket error:', error);
-        cleanupServices();
-    });
-
-    // Initialize services immediately upon connection
-    initializeServices();
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+server.listen(3000, () => {
+    console.log('🚀 Server running on port 3000');
 }); 
